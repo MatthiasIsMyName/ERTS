@@ -26,25 +26,42 @@ const int BUTTON_PIN       = 3;  //push button pin
 const int LIGHT_SENSOR_PIN = 2;  //light sensor pin
 const int POTI_PIN         = A0; //analog input pin for potentiometer
 
+//other defines
+const unsigned long DEBOUNCE_DELAY_MS = 200;
+const short number_of_states = 3;
+const unsigned long required_angle = 278;
+const unsigned long drop_time_ms = 359;
+const unsigned long full_circle_angle = 360;
+
 //prototypes
 void log_task(void* pvParameters);
 void log_message(const char* message);
 void log_message_ISR(const char* message);
+void motor_control_task(void* pvParameters);
+void trigger_motor();
+void button_ISR();
+void light_sensor_ISR();
+void drop_ball_task(void* pvParameters);
 
 //variables
 volatile int rotation_time_ms = 0;           //measured rotation time of disc in ms
 volatile int32_t wait_time_drop_ball_ms = 0; //calculated wait time to drop disc in ms
+volatile unsigned long last_button_press_time_ms = 0;
+volatile unsigned long last_light_sensor_detected_ms = 0;
+volatile byte disk_turns = 0;
 
 enum STATES {
-    RUNNING = 0, //disc is rotating, magnet on
+    RUNNING = 0, //disc is rotating, magnet onDEBOUNCE_DELAY
     DROPPING,    //disc is rotating, magnet is released after x rotations
     STOPPED      //disc stopped, magnet off
 };
 volatile int control_state = RUNNING; //controls the state of ball drop system
 
+
 //task handles
 TaskHandle_t log_task_handle = nullptr;
-
+TaskHandle_t motor_control_task_handle = nullptr;
+TaskHandle_t drop_ball_task_handle = nullptr;
 //queue handles
 QueueHandle_t log_queue = NULL; // @suppress("Type cannot be resolved")
 
@@ -52,6 +69,8 @@ QueueHandle_t log_queue = NULL; // @suppress("Type cannot be resolved")
 typedef char log_message_t[MAX_LOG_LENGTH];
 
 //semaphore handles
+SemaphoreHandle_t motor_timer_semaphore = NULL;
+SemaphoreHandle_t ball_drop_semaphore = NULL;
 
 void setup() {
     //init serial connection
@@ -85,6 +104,12 @@ void setup() {
     configASSERT(log_queue != NULL);
 
     //create semaphore(s)
+    motor_timer_semaphore = xSemaphoreCreateBinary();
+    configASSERT(motor_timer_semaphore != NULL);
+
+    ball_drop_semaphore = xSemaphoreCreateBinary();
+    configASSERT(ball_drop_semaphore != NULL);
+
 
     //create task(s)
     BaseType_t result = xTaskCreate(
@@ -98,12 +123,37 @@ void setup() {
     configASSERT(result == pdPASS);           //assert that the task could be created
     configASSERT(log_task_handle != nullptr); //assert that task handle is valid
 
+    BaseType_t motor_control_task_result = xTaskCreate(
+		motor_control_task,                  //address of task function
+		"motor_control_task",                //name of task
+		256L,                      //task stack size in words: 256*2=512 bytes (configSTACK_DEPTH_TYPE)
+		nullptr,                   //task parameters
+		12,                        //task priority (2-16)
+		&motor_control_task_handle           //pointer to task handle
+	);
+	configASSERT(motor_control_task_result == pdPASS);           //assert that the task could be created
+	configASSERT(motor_control_task_handle != nullptr); //assert that task handle is valid
+
+	BaseType_t drop_ball_task_result = xTaskCreate(
+		drop_ball_task,                  //address of task function
+		"drop_ball_task",                //name of task
+		256L,                      //task stack size in words: 256*2=512 bytes (configSTACK_DEPTH_TYPE)
+		nullptr,                   //task parameters
+		15,                        //task priority (2-16)
+		&drop_ball_task_handle           //pointer to task handle
+	);
+	configASSERT(drop_ball_task_result == pdPASS);           //assert that the task could be created
+	configASSERT(drop_ball_task_handle != nullptr); //assert that task handle is valid
+
     //button ISR
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN),button_ISR, RISING);
 
     //light sensor ISR
+    attachInterrupt(digitalPinToInterrupt(LIGHT_SENSOR_PIN), light_sensor_ISR, RISING);
 
     //start timer motor_control
-
+    Timer5.initialize(100000);
+    Timer5.attachInterrupt(trigger_motor);
 }
 
 //idle task
@@ -154,6 +204,75 @@ void log_message_ISR(const char* message) {
 }
 
 //your ISRs and tasks...
+void button_ISR(){
+	unsigned long current_button_press_time_ms = millis();
+	if(last_button_press_time_ms == 0 || current_button_press_time_ms - last_button_press_time_ms > DEBOUNCE_DELAY_MS){
+		last_button_press_time_ms = current_button_press_time_ms;
+		control_state = (control_state + 1) % number_of_states;
+		if(control_state == RUNNING){
+			digitalWrite(MAGNET_PWM_PIN, HIGH);
+		}
+	}
+}
+
+void light_sensor_ISR(){
+	unsigned long current_light_sensor_detected_ms = millis();
+	rotation_time_ms = current_light_sensor_detected_ms - last_light_sensor_detected_ms;
+	last_light_sensor_detected_ms = current_light_sensor_detected_ms;
+
+	wait_time_drop_ball_ms = ( ( rotation_time_ms * required_angle ) / full_circle_angle ) - drop_time_ms;
+	while(wait_time_drop_ball_ms < 0){
+		wait_time_drop_ball_ms += rotation_time_ms;
+	}
+
+	if(control_state == DROPPING){
+		if(disk_turns == 2){
+			disk_turns = 0;
+			BaseType_t taskChangeRequired = pdFALSE;
+			xSemaphoreGiveFromISR(ball_drop_semaphore, &taskChangeRequired);
+			//to immediately run the scheduler (change task)
+			if (taskChangeRequired == pdTRUE) {
+			taskYIELD();
+			}
+		}
+		else{
+			disk_turns++;
+		}
+//		log_message_ISR(String(disk_turns).c_str());
+	}
+
+}
+
+void trigger_motor(){
+	BaseType_t taskChangeRequired = pdFALSE;
+	xSemaphoreGiveFromISR(motor_timer_semaphore, &taskChangeRequired);
+	//to immediately run the scheduler (change task)
+	if (taskChangeRequired == pdTRUE) {
+	taskYIELD();
+	}
+}
+
+void motor_control_task(void* pvParameters){
+	while(true){
+		//wait infinitely for semaphore
+		xSemaphoreTake(motor_timer_semaphore, portMAX_DELAY);
+		if(control_state == STOPPED){
+			analogWrite(MOTOR_PWM_PIN, 0);
+		}
+		else{
+			analogWrite(MOTOR_PWM_PIN, analogRead(POTI_PIN));
+		}
+	}
+}
+
+void drop_ball_task(void* pvParameters){
+	while(true){
+		//wait infinitely for semaphore
+		xSemaphoreTake(ball_drop_semaphore, portMAX_DELAY);
+		delay(wait_time_drop_ball_ms);
+		digitalWrite(MAGNET_PWM_PIN, LOW);
+	}
+}
 
 /***************************************************************************/
 // FreeRTOS extended error handlers
